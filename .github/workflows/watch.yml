@@ -1,0 +1,70 @@
+name: 알뜰폰 프로모션 감시
+
+on:
+  schedule:
+    # 30분마다 (UTC 기준이지만 간격 방식이라 시차 무관)
+    # GitHub 예약 실행은 혼잡 시간대에 5~15분 지연될 수 있음
+    - cron: "*/30 * * * *"
+  workflow_dispatch: # 수동 실행 버튼
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mvno-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 변경 확인
+        id: check
+        run: |
+          set +e
+          node check.js
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: 조회 실패 경고
+        if: steps.check.outputs.status == '2'
+        run: echo "::warning::사이트 조회에 실패했습니다(3회 재시도 후). 다음 실행에서 다시 시도합니다."
+
+      - name: 텔레그램 알림 전송
+        if: steps.check.outputs.status == '1'
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -e
+          response=$(curl -sS -X POST \
+            "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text@telegram.txt" \
+            -d "parse_mode=HTML" \
+            -d "disable_web_page_preview=true")
+          echo "$response" | head -c 500
+          echo "$response" | grep -q '"ok":true' || { echo "::error::텔레그램 전송 실패"; exit 1; }
+
+      - name: 스냅샷 커밋
+        if: steps.check.outputs.status != '2'
+        run: |
+          git config user.name "mvno-watch[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snapshot.json last_checked.txt
+          if git diff --cached --quiet; then
+            echo "커밋할 변경 없음"
+          else
+            if [ -s changes.txt ]; then
+              msg=$(head -1 changes.txt)
+            else
+              msg="확인 기록 갱신"
+            fi
+            git commit -m "$msg"
+            git push
+          fi
